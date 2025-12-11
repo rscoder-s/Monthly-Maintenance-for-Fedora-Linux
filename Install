@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+
+# ==============================================================================
+# MONTHLY MAINTENANCE INSTALLER
+# ==============================================================================
+
+import sys
+import os
+import time
+import shutil
+import threading
+import stat
+import subprocess
+import re
+
+# --- 0. DETACH FROM TERMINAL LOGIC ---
+# If we are running in a terminal, spawn a detached background process and exit.
+# This makes the terminal window close immediately while the GUI stays open.
+if os.isatty(sys.stdin.fileno()):
+    # Re-run this script using nohup logic, completely detached
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    sys.exit(0)
+
+# --- 1. DEPENDENCY CHECK ---
+try:
+    import gi
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    from gi.repository import Gtk, Adw, GLib, Gio
+except Exception as e:
+    try:
+        subprocess.run(['notify-send', 'Installer Error', 
+                        f'Missing Libadwaita/GTK4.\n{e}', '--urgency=critical'])
+    except: pass
+    sys.exit(1)
+
+# --- CONSTANTS ---
+APP_NAME = 'Monthly Maintenance'
+# We use abspath to ensure we find the sibling file correctly
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOURCE_FILE = os.path.join(SCRIPT_DIR, 'monthly-maintenance')
+
+BIN_DIR = os.path.expanduser('~/.local/bin')
+APP_DIR = os.path.expanduser('~/.local/share/applications')
+AUTOSTART_DIR = os.path.expanduser('~/.config/autostart')
+CONFIG_DIR = os.path.expanduser('~/.config/monthly-updater')
+
+TARGET_BIN = os.path.join(BIN_DIR, 'monthly-maintenance')
+TARGET_DESKTOP = os.path.join(APP_DIR, 'monthly-maintainer.desktop')
+TARGET_AUTOSTART = os.path.join(AUTOSTART_DIR, 'monthly-maintainer.desktop')
+
+# --- HELPERS ---
+def get_source_version():
+    if not os.path.exists(SOURCE_FILE): return 'Unknown'
+    try:
+        with open(SOURCE_FILE, 'r') as f: c = f.read()
+        m = re.search(r'APP_VERSION="([^"]+)"', c)
+        return m.group(1) if m else 'Unknown'
+    except: return 'Unknown'
+
+def get_installed_version():
+    if not os.path.exists(TARGET_BIN): return None
+    try:
+        with open(TARGET_BIN, 'r') as f: c = f.read()
+        m = re.search(r'APP_VERSION="([^"]+)"', c)
+        return m.group(1) if m else 'Unknown'
+    except: pass
+    return 'Unknown'
+
+SRC_VER = get_source_version()
+
+# --- GUI CLASS ---
+class InstallerWindow(Adw.Window):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title('Setup Wizard')
+        self.set_default_size(500, 600)
+        
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(self.main_box)
+        
+        self.header = Adw.HeaderBar()
+        self.main_box.append(self.header)
+        
+        self.clamp = Adw.Clamp()
+        self.clamp.set_maximum_size(450)
+        self.clamp.set_margin_top(20)
+        self.clamp.set_margin_bottom(20)
+        self.clamp.set_margin_start(12)
+        self.clamp.set_margin_end(12)
+        self.main_box.append(self.clamp)
+        
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.clamp.set_child(self.content)
+        
+        # Header
+        self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.header_box.set_margin_bottom(12)
+        
+        self.icon = Gtk.Image.new_from_icon_name('system-software-install-symbolic')
+        self.icon.set_pixel_size(96)
+        self.icon.add_css_class('accent') 
+        self.header_box.append(self.icon)
+        
+        self.title_label = Gtk.Label(label='Monthly Maintenance')
+        self.title_label.add_css_class('title-1')
+        self.header_box.append(self.title_label)
+        
+        self.subtitle_label = Gtk.Label(label='Setup Wizard')
+        self.subtitle_label.add_css_class('title-3')
+        self.subtitle_label.add_css_class('dim-label')
+        self.header_box.append(self.subtitle_label)
+        
+        self.content.append(self.header_box)
+        
+        # Action Group
+        self.action_group = Adw.PreferencesGroup()
+        self.content.append(self.action_group)
+        
+        # Progress Group
+        self.progress_group = Adw.PreferencesGroup()
+        self.progress_group.set_visible(False)
+        self.content.append(self.progress_group)
+        
+        self.row_1 = self.create_progress_row('System Check')
+        self.row_2 = self.create_progress_row('Copying Files')
+        self.row_3 = self.create_progress_row('Registering App')
+        self.row_4 = self.create_progress_row('Configuring Autostart')
+        
+        # Buttons
+        self.btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.btn_box.set_margin_top(10)
+        self.content.append(self.btn_box)
+        
+        self.btn_install = Gtk.Button(label=f'Install v{SRC_VER}')
+        self.btn_install.add_css_class('pill')
+        self.btn_install.add_css_class('suggested-action')
+        self.btn_install.set_size_request(-1, 50)
+        self.btn_install.connect('clicked', self.on_install)
+        
+        self.btn_repair = Gtk.Button(label='Repair / Update')
+        self.btn_repair.add_css_class('pill')
+        self.btn_repair.add_css_class('suggested-action')
+        self.btn_repair.set_size_request(-1, 50)
+        self.btn_repair.connect('clicked', self.on_install)
+        
+        self.btn_uninstall = Gtk.Button(label='Uninstall')
+        self.btn_uninstall.add_css_class('pill')
+        self.btn_uninstall.add_css_class('destructive-action')
+        self.btn_uninstall.set_size_request(-1, 50)
+        self.btn_uninstall.connect('clicked', self.on_uninstall)
+
+        self.btn_close = Gtk.Button(label='Close')
+        self.btn_close.add_css_class('pill')
+        self.btn_close.set_size_request(-1, 50)
+        self.btn_close.set_visible(False)
+        self.btn_close.connect('clicked', lambda x: self.close())
+        
+        self.btn_box.append(self.btn_install)
+        self.btn_box.append(self.btn_repair)
+        self.btn_box.append(self.btn_uninstall)
+        self.btn_box.append(self.btn_close)
+
+        self.check_installed_state()
+
+    def create_progress_row(self, title):
+        row = Adw.ActionRow()
+        row.set_title(title)
+        spinner = Gtk.Spinner()
+        spinner.set_visible(False)
+        icon = Gtk.Image.new_from_icon_name('object-select-symbolic')
+        icon.add_css_class('success')
+        icon.set_visible(False)
+        row.add_suffix(spinner)
+        row.add_suffix(icon)
+        self.progress_group.add(row)
+        row._spinner = spinner
+        row._icon = icon
+        return row
+
+    def check_installed_state(self):
+        curr_ver = get_installed_version()
+        if curr_ver:
+            self.subtitle_label.set_label(f'Version {curr_ver} Installed')
+            self.icon.set_from_icon_name('object-select-symbolic')
+            self.icon.add_css_class('success')
+            self.icon.remove_css_class('accent')
+            self.btn_install.set_visible(False)
+            self.btn_repair.set_visible(True)
+            self.btn_uninstall.set_visible(True)
+            
+            if str(SRC_VER) != str(curr_ver):
+                self.btn_repair.set_label(f'Update to v{SRC_VER}')
+            else:
+                self.btn_repair.set_label('Reinstall / Repair')
+        else:
+            self.subtitle_label.set_label('Ready to Install')
+            self.icon.set_from_icon_name('system-software-install-symbolic')
+            self.btn_install.set_visible(True)
+            self.btn_repair.set_visible(False)
+            self.btn_uninstall.set_visible(False)
+            if not os.path.exists(SOURCE_FILE):
+                self.btn_install.set_sensitive(False)
+                self.btn_install.set_label('Source File Missing!')
+
+    def set_row_state(self, row, state):
+        def _u():
+            if state == 'run':
+                row._spinner.set_visible(True); row._spinner.start(); row._icon.set_visible(False)
+            elif state == 'ok':
+                row._spinner.stop(); row._spinner.set_visible(False)
+                row._icon.set_from_icon_name('object-select-symbolic'); row._icon.set_visible(True)
+            elif state == 'trash':
+                row._spinner.stop(); row._spinner.set_visible(False)
+                row._icon.set_from_icon_name('user-trash-symbolic'); row._icon.set_visible(True)
+        GLib.idle_add(_u)
+
+    def on_install(self, btn): self.start_process('install')
+    def on_uninstall(self, btn): self.start_process('uninstall')
+
+    def start_process(self, mode):
+        self.btn_install.set_visible(False)
+        self.btn_repair.set_visible(False)
+        self.btn_uninstall.set_visible(False)
+        self.action_group.set_visible(False)
+        self.progress_group.set_visible(True)
+        threading.Thread(target=self.run_process, args=(mode,), daemon=True).start()
+
+    def run_process(self, mode):
+        # 1. System Check
+        self.set_row_state(self.row_1, 'run'); time.sleep(0.5)
+        os.makedirs(BIN_DIR, exist_ok=True)
+        os.makedirs(APP_DIR, exist_ok=True)
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        self.set_row_state(self.row_1, 'ok')
+
+        # 2. Files
+        self.set_row_state(self.row_2, 'run'); time.sleep(0.5)
+        if mode == 'install':
+            if os.path.exists(SOURCE_FILE):
+                shutil.copy2(SOURCE_FILE, TARGET_BIN)
+                st = os.stat(TARGET_BIN)
+                os.chmod(TARGET_BIN, st.st_mode | stat.S_IEXEC)
+                self.set_row_state(self.row_2, 'ok')
+            else: self.set_row_state(self.row_2, 'trash')
+        else:
+            if os.path.exists(TARGET_BIN): os.remove(TARGET_BIN)
+            if os.path.exists(CONFIG_DIR): shutil.rmtree(CONFIG_DIR)
+            self.set_row_state(self.row_2, 'trash')
+
+        # 3. Register App
+        self.set_row_state(self.row_3, 'run'); time.sleep(0.3)
+        if mode == 'install':
+            with open(TARGET_DESKTOP, 'w') as f:
+                f.write(f'''[Desktop Entry]
+Type=Application
+Name={APP_NAME}
+Comment=System Update Manager
+Exec=bash "{TARGET_BIN}" --run-gui
+Icon=software-update-available-symbolic
+Terminal=false
+Categories=System;Settings;
+''')
+            subprocess.call(['update-desktop-database', APP_DIR])
+            self.set_row_state(self.row_3, 'ok')
+        else:
+            if os.path.exists(TARGET_DESKTOP): os.remove(TARGET_DESKTOP)
+            subprocess.call(['update-desktop-database', APP_DIR])
+            self.set_row_state(self.row_3, 'trash')
+
+        # 4. Autostart
+        self.set_row_state(self.row_4, 'run'); time.sleep(0.4)
+        if mode == 'install':
+            with open(TARGET_AUTOSTART, 'w') as f:
+                f.write(f'''[Desktop Entry]
+Type=Application
+Name={APP_NAME} Monitor
+Exec=bash "{TARGET_BIN}" --check-silent
+Icon=software-update-available-symbolic
+Terminal=false
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+''')
+            self.set_row_state(self.row_4, 'ok')
+        else:
+            if os.path.exists(TARGET_AUTOSTART): os.remove(TARGET_AUTOSTART)
+            self.set_row_state(self.row_4, 'trash')
+
+        GLib.idle_add(self.on_done, mode)
+
+    def on_done(self, mode):
+        self.btn_close.set_visible(True)
+        self.btn_close.add_css_class('suggested-action')
+        if mode == 'install':
+            self.subtitle_label.set_label('Installation Complete')
+            self.icon.set_from_icon_name('object-select-symbolic')
+            self.icon.add_css_class('success')
+            self.icon.remove_css_class('accent')
+        else:
+            self.subtitle_label.set_label('Cleanup Complete')
+            self.icon.set_from_icon_name('user-trash-symbolic')
+
+class App(Adw.Application):
+    def __init__(self): super().__init__(application_id='com.local.Installer', flags=Gio.ApplicationFlags.FLAGS_NONE)
+    def do_activate(self): InstallerWindow(application=self).present()
+
+if __name__ == '__main__': App().run(sys.argv)
