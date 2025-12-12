@@ -1,122 +1,161 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# MONTHLY MAINTENANCE INSTALLER (v0.1.0)
+# UNIVERSAL INSTALLER version 0.1.2
 # ==============================================================================
 
-import sys
-import os
-import time
-import shutil
-import threading
-import stat
-import subprocess
-import re
+import sys, os, time, shutil, threading, stat, subprocess, re, importlib.util
 
-# --- 0. DETACH FROM TERMINAL LOGIC ---
+# ==============================================================================
+# ▼▼▼ DEVELOPER CONFIGURATION ▼▼▼
+# ==============================================================================
+
+# 1. App Manifest (Must match filenames in 'sources/' and internal APP_ID)
+APP_IDS = [
+    "monthly-maintenance"
+]
+
+# 2. Dependency Checks
+CHECK_STRATEGIES = {
+    "python3-gobject":  lambda: check_python_import("gi"),
+    "python3-libadwaita": lambda: check_adwaita(),
+    "libnotify":        lambda: check_binary("notify-send"),
+    "dnf-automatic":    lambda: check_binary("dnf-automatic"),
+    "distrobox":        lambda: check_binary("distrobox")
+}
+
+# ==============================================================================
+# ▲▲▲ END CONFIGURATION ▲▲▲
+# ==============================================================================
+
+# --- 0. DETACH LOGIC ---
 if os.isatty(sys.stdin.fileno()):
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True
-    )
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
     sys.exit(0)
 
-# --- 1. DEPENDENCY CHECK ---
+# --- 1. BOOTSTRAP CHECK ---
 try:
     import gi
     gi.require_version('Gtk', '4.0')
     gi.require_version('Adw', '1')
     from gi.repository import Gtk, Adw, GLib, Gio, Gdk
-except Exception as e:
-    try:
-        subprocess.run(['notify-send', 'Installer Error', 
-                        f'Missing Libadwaita/GTK4.\n{e}', '--urgency=critical'])
-    except: pass
-    sys.exit(1)
+except: sys.exit(1)
 
-# --- CONSTANTS ---
-APP_NAME = 'Monthly Maintenance'
+# --- PATHS ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SOURCE_FILE = os.path.join(SCRIPT_DIR, 'sources', 'monthly-maintenance')
-
+SOURCES_DIR = os.path.join(SCRIPT_DIR, 'sources')
 BIN_DIR = os.path.expanduser('~/.local/bin')
 APP_DIR = os.path.expanduser('~/.local/share/applications')
 AUTOSTART_DIR = os.path.expanduser('~/.config/autostart')
-CONFIG_DIR = os.path.expanduser('~/.config/monthly-updater')
 
-TARGET_BIN = os.path.join(BIN_DIR, 'monthly-maintenance')
-TARGET_DESKTOP = os.path.join(APP_DIR, 'monthly-maintainer.desktop')
-TARGET_AUTOSTART = os.path.join(AUTOSTART_DIR, 'monthly-maintainer.desktop')
+# --- CHECKS ---
+def check_python_import(module_name): return importlib.util.find_spec(module_name) is not None
+def check_binary(bin_name): return shutil.which(bin_name) is not None
+def check_adwaita():
+    try: import gi; gi.require_version('Adw', '1'); from gi.repository import Adw; return True
+    except: return False
 
-# --- HELPERS ---
-def get_source_version():
-    if not os.path.exists(SOURCE_FILE): return 'Unknown'
+def check_smart_dependencies(deps_list):
+    missing = []
+    for dep in deps_list:
+        if dep in CHECK_STRATEGIES:
+            if not CHECK_STRATEGIES[dep](): missing.append(dep)
+        elif not check_binary(dep): missing.append(dep)
+    return missing
+
+# --- METADATA PARSER ---
+def parse_app_metadata(app_id):
+    path = os.path.join(SOURCES_DIR, app_id)
+    if not os.path.exists(path): return {'error': 'File Not Found'}
+    
     try:
-        with open(SOURCE_FILE, 'r') as f: c = f.read()
-        m = re.search(r'APP_VERSION="([^"]+)"', c)
+        with open(path, 'r') as f: content = f.read()
+        id_match = re.search(r'APP_ID="([^"]+)"', content)
+        if not id_match: return {'error': 'Missing APP_ID Header'}
+        if id_match.group(1) != app_id: return {'error': f'ID Mismatch'}
+        
+        data = { "id": app_id, "default_install": True, "default_autostart": True }
+        
+        name_match = re.search(r'APP_NAME="([^"]+)"', content)
+        ver_match = re.search(r'APP_VERSION="([^"]+)"', content)
+        
+        if not name_match or not ver_match: return {'error': 'Missing Name/Version'}
+            
+        data['APP_NAME'] = name_match.group(1)
+        data['APP_VERSION'] = ver_match.group(1)
+        
+        for key in ["APP_ICON", "APP_DESC", "APP_CATS", "APP_ARGS_RUN", "APP_ARGS_AUTO", "APP_DEPS"]:
+            m = re.search(f'{key}="([^"]+)"', content)
+            data[key] = m.group(1) if m else ""
+            
+        data['dependencies'] = [d.strip() for d in data['APP_DEPS'].split(';') if d.strip()]
+        return data
+    except Exception as e: return {'error': f'Read Error: {str(e)}'}
+
+def get_installed_version(app_id):
+    path = os.path.join(BIN_DIR, app_id)
+    if not os.path.exists(path): return None
+    try:
+        with open(path, 'r') as f: content = f.read()
+        m = re.search(r'APP_VERSION="([^"]+)"', content)
         return m.group(1) if m else 'Unknown'
     except: return 'Unknown'
-
-def get_installed_version():
-    if not os.path.exists(TARGET_BIN): return None
-    try:
-        with open(TARGET_BIN, 'r') as f: c = f.read()
-        m = re.search(r'APP_VERSION="([^"]+)"', c)
-        return m.group(1) if m else 'Unknown'
-    except: pass
-    return 'Unknown'
-
-SRC_VER = get_source_version()
 
 # --- GUI CLASS ---
 class InstallerWindow(Adw.Window):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.set_title('Setup Wizard')
-        self.set_default_size(500, 650)
+        self.set_default_size(550, 700)
         
-        # Add custom CSS for the link color
-        css_provider = Gtk.CssProvider()
-        css_provider.load_from_data(b"label.license-text link { color: #3584e4; }")
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
+        css = Gtk.CssProvider()
+        css.load_from_data(b"label.license-text link { color: #3584e4; } .error-banner { background-color: #e01b24; color: white; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         
         self.nav = Adw.NavigationView()
         self.set_content(self.nav)
         
+        # LOAD DATA
+        self.valid_apps = []
+        self.corrupt_apps = []
+        self.all_deps = set()
+        
+        for app_id in APP_IDS:
+            meta = parse_app_metadata(app_id)
+            if 'error' in meta: self.corrupt_apps.append(f"{app_id}: {meta['error']}")
+            else:
+                self.valid_apps.append(meta)
+                for d in meta['dependencies']: self.all_deps.add(d)
+        
+        self.app_rows = {}
         self.create_pages()
         self.nav.add(self.page_welcome)
-        self.check_installed_state()
+        self.scan_state()
 
     def create_pages(self):
-        # 1. WELCOME PAGE
+        # 1. WELCOME
         self.page_welcome = Adw.NavigationPage(title='Welcome', tag='welcome')
         box1 = self.create_base_layout()
         self.page_welcome.set_child(box1['root'])
         
         self.hero = Adw.StatusPage()
         self.hero.set_icon_name('system-software-install-symbolic')
-        self.hero.set_title('Monthly Maintenance')
-        self.hero.set_description('Setup Wizard')
+        self.hero.set_title('Software Setup')
+        self.hero.set_description('Universal Installer')
         box1['content'].append(self.hero)
         
-        self.btn_install = self.create_main_button('Install', 'suggested-action', self.on_goto_options)
-        self.btn_repair = self.create_main_button('Repair', 'suggested-action', self.on_goto_options)
-        self.btn_uninstall = self.create_main_button('Uninstall', 'destructive-action', self.on_uninstall_click)
-        
-        box1['content'].append(self.btn_install)
-        box1['content'].append(self.btn_repair)
-        box1['content'].append(self.btn_uninstall)
+        self.btn_install = self.create_main_button('Install / Update', 'suggested-action', self.on_goto_options)
+        self.btn_uninstall = self.create_main_button('Uninstall All', 'destructive-action', self.on_uninstall_click)
+        box1['content'].append(self.btn_install); box1['content'].append(self.btn_uninstall)
 
-        # 2. OPTIONS PAGE
-        self.page_options = Adw.NavigationPage(title='Configuration', tag='options')
+        # 2. OPTIONS
+        self.page_options = Adw.NavigationPage(title='Configure your installation', tag='options')
         box2 = self.create_base_layout()
         self.page_options.set_child(box2['root'])
         
+        self.err_banner = Adw.Banner(); self.err_banner.set_button_label(None); self.err_banner.set_revealed(False)
+        box2['content'].append(self.err_banner)
+
         # --- LICENSE TEXT (Standalone Label) ---
         lic_label = Gtk.Label(xalign=0, wrap=True)
         lic_label.set_markup(
@@ -132,91 +171,52 @@ class InstallerWindow(Adw.Window):
         lic_label.set_margin_end(10)
         box2['content'].append(lic_label)
         
-        # Settings Group
-        opt_group = Adw.PreferencesGroup()
-        opt_group.set_title("Installation Options")
-        box2['content'].append(opt_group)
+        self.apps_group = Adw.PreferencesGroup()
+        self.apps_group.set_title("Select Components")
+        box2['content'].append(self.apps_group)
         
-        # Checkbox 1
-        self.chk_install = Gtk.CheckButton()
-        self.chk_install.set_active(True)
-        self.chk_install.set_sensitive(False)
-        row_inst = Adw.ActionRow()
-        row_inst.set_title("Install Application")
-        row_inst.set_subtitle(f"Install v{SRC_VER} to ~/.local/bin")
-        row_inst.add_prefix(self.chk_install)
-        opt_group.add(row_inst)
-        
-        # Checkbox 2
-        self.chk_autostart = Gtk.CheckButton()
-        self.chk_autostart.set_active(True)
-        row_auto = Adw.ActionRow()
-        row_auto.set_title("Run on Startup")
-        row_auto.set_subtitle("Launch automatically when you login")
-        row_auto.add_prefix(self.chk_autostart)
-        row_auto.set_activatable_widget(self.chk_autostart)
-        opt_group.add(row_auto)
-        
-        btn_confirm = self.create_main_button('Accept & Install', 'suggested-action', self.on_start_install)
-        box2['content'].append(btn_confirm)
+        for app in self.valid_apps: self.create_app_row(app)
+            
+        self.dep_banner = Adw.Banner(); self.dep_banner.set_button_label(None); self.dep_banner.set_revealed(False)
+        box2['content'].append(self.dep_banner)
 
-        # 3. PROGRESS PAGE (Fixed Layout Logic)
-        self.page_progress = Adw.NavigationPage(title='Installing', tag='progress')
-        self.page_progress.set_can_pop(False) 
+        self.btn_confirm = self.create_main_button('Start', 'suggested-action', self.on_start_process)
+        box2['content'].append(self.btn_confirm)
+
+        # 3. PROGRESS
+        self.page_progress = Adw.NavigationPage(title='Working', tag='progress')
+        self.page_progress.set_can_pop(False)
         
-        # Use ToolbarView for proper background styling
-        prog_root = Adw.ToolbarView()
-        prog_header = Adw.HeaderBar()
-        prog_root.add_top_bar(prog_header)
+        prog_root = Adw.ToolbarView(); prog_root.add_top_bar(Adw.HeaderBar())
         self.page_progress.set_child(prog_root)
-        
-        # Main Vertical Layout
         prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         prog_root.set_content(prog_box)
         
-        # 3a. FIXED HEADER (Icon + Title)
         self.prog_status = Adw.StatusPage()
         self.prog_status.set_title('Working...')
         self.prog_status.set_icon_name('system-software-install-symbolic')
-        self.prog_status.set_vexpand(False) 
-        self.prog_status.set_margin_top(30)
-        self.prog_status.set_margin_bottom(20)
+        self.prog_status.set_vexpand(False)
+        self.prog_status.set_margin_top(30); self.prog_status.set_margin_bottom(20)
         prog_box.append(self.prog_status)
         
-        # 3b. SCROLLABLE CONTENT (The List + Button)
-        prog_scroll = Gtk.ScrolledWindow()
-        prog_scroll.set_vexpand(True)
+        prog_scroll = Gtk.ScrolledWindow(); prog_scroll.set_vexpand(True)
         prog_box.append(prog_scroll)
-        
         prog_clamp = Adw.Clamp(maximum_size=450, margin_bottom=24, margin_start=12, margin_end=12)
         prog_scroll.set_child(prog_clamp)
-        
         prog_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         prog_clamp.set_child(prog_content)
         
         self.prog_group = Adw.PreferencesGroup()
         prog_content.append(self.prog_group)
         
-        self.row_1 = self.create_progress_row('System Check')
-        self.row_2 = self.create_progress_row('Copying Files')
-        self.row_3 = self.create_progress_row('Registering App')
-        self.row_4 = self.create_progress_row('Configuring Autostart')
-        
-        # Close button starts hidden
         self.btn_close = self.create_main_button('Close', 'suggested-action', lambda x: self.close())
-        self.btn_close.set_visible(False) 
+        self.btn_close.set_visible(False)
         prog_content.append(self.btn_close)
 
-    # --- UI FACTORY ---
     def create_base_layout(self):
-        root = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        root.add_top_bar(header)
-        
-        scroll = Gtk.ScrolledWindow()
-        root.set_content(scroll)
-        
-        clamp = Adw.Clamp(maximum_size=450, margin_top=24, margin_bottom=24, margin_start=12, margin_end=12)
+        root = Adw.ToolbarView(); root.add_top_bar(Adw.HeaderBar())
+        scroll = Gtk.ScrolledWindow(); root.set_content(scroll)
+        clamp = Adw.Clamp(maximum_size=450, margin_top=20, margin_bottom=20, margin_start=12, margin_end=12)
         scroll.set_child(clamp)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
         clamp.set_child(content)
@@ -224,155 +224,187 @@ class InstallerWindow(Adw.Window):
 
     def create_main_button(self, label, css, callback):
         btn = Gtk.Button(label=label)
-        btn.add_css_class('pill')
-        btn.add_css_class(css)
-        btn.set_size_request(-1, 50)
+        btn.add_css_class('pill'); btn.add_css_class(css); btn.set_size_request(-1, 50)
         btn.connect('clicked', callback)
         return btn
 
-    def create_progress_row(self, title):
-        row = Adw.ActionRow()
-        row.set_title(title)
-        spinner = Gtk.Spinner()
-        spinner.set_visible(False)
-        icon = Gtk.Image.new_from_icon_name('object-select-symbolic')
-        icon.add_css_class('success')
-        icon.set_visible(False)
-        row.add_suffix(spinner)
-        row.add_suffix(icon)
-        self.prog_group.add(row)
-        row._spinner = spinner
-        row._icon = icon
-        return row
+    def create_app_row(self, app):
+        row = Adw.ExpanderRow()
+        row.set_title(app['APP_NAME'])
+        row.set_subtitle(app['APP_DESC'])
+        row.set_icon_name(app['APP_ICON'] or 'application-x-executable')
+        
+        # --- UX FIX: CHECKBOX FOR INSTALL SELECTION ---
+        chk_install = Gtk.CheckButton()
+        chk_install.set_active(True)
+        chk_install.set_valign(Gtk.Align.CENTER)
+        row.add_prefix(chk_install) # Checkbox goes on the LEFT
+        
+        # Autostart Row
+        row_auto = Adw.ActionRow()
+        row_auto.set_title("Run on Startup")
+        sw_auto = Gtk.Switch()
+        sw_auto.set_active(True)
+        sw_auto.set_valign(Gtk.Align.CENTER)
+        row_auto.add_suffix(sw_auto)
+        row.add_row(row_auto)
+        
+        # --- LOGIC FIX: CONNECT SIGNAL ---
+        # When Install is unchecked, Autostart must die.
+        def on_install_toggled(btn):
+            is_installing = btn.get_active()
+            row_auto.set_sensitive(is_installing) # Disable the row
+            if not is_installing:
+                sw_auto.set_active(False) # Turn off logic
+                row.set_subtitle("Will not be installed")
+            else:
+                row.set_subtitle(app['APP_DESC']) # Restore desc
+                # Optional: Restore autostart default? Let's leave it manual for now.
+                
+        chk_install.connect("toggled", on_install_toggled)
+        
+        self.apps_group.add(row)
+        self.app_rows[app['id']] = { 'install_chk': chk_install, 'autostart_switch': sw_auto, 'row': row }
 
-    # --- LOGIC ---
-    def check_installed_state(self):
-        curr_ver = get_installed_version()
-        if curr_ver:
-            self.hero.set_description(f'Version {curr_ver} Installed')
-            self.btn_install.set_visible(False)
-            self.btn_repair.set_visible(True)
-            self.btn_uninstall.set_visible(True)
-            if str(SRC_VER) != str(curr_ver):
-                self.btn_repair.set_label(f'Update to v{SRC_VER}')
-        else:
-            self.hero.set_description('Ready to Install')
-            self.btn_install.set_visible(True)
-            self.btn_repair.set_visible(False)
-            self.btn_uninstall.set_visible(False)
-            if not os.path.exists(SOURCE_FILE):
-                self.btn_install.set_sensitive(False)
-                self.btn_install.set_label('Source File Missing!')
+    def add_progress_row_thread(self, title):
+        res = [None]
+        def _add(): 
+            row = Adw.ActionRow(); row.set_title(title)
+            spinner = Gtk.Spinner(); spinner.set_visible(False)
+            icon = Gtk.Image.new_from_icon_name('object-select-symbolic')
+            icon.add_css_class('success'); icon.set_visible(False)
+            row.add_suffix(spinner); row.add_suffix(icon)
+            self.prog_group.add(row)
+            res[0] = {'row': row, 'spinner': spinner, 'icon': icon}
+        GLib.idle_add(_add)
+        while res[0] is None: time.sleep(0.05)
+        return res[0]
 
-    def on_goto_options(self, btn):
-        self.nav.push(self.page_options)
+    def scan_state(self):
+        if self.corrupt_apps:
+            self.err_banner.set_revealed(True)
+            self.err_banner.set_title(f"Warning: {len(self.corrupt_apps)} app(s) failed integrity checks. You may need to re-download the software.")
 
-    def on_start_install(self, btn):
-        do_autostart = self.chk_autostart.get_active()
-        self.nav.push(self.page_progress)
-        thread = threading.Thread(target=self.run_process, args=('install', do_autostart))
-        thread.daemon = True
-        thread.start()
+        self.missing_deps = check_smart_dependencies(self.all_deps)
+        self.can_auto = (shutil.which('dnf') is not None)
 
+        if self.missing_deps:
+            self.dep_banner.set_revealed(True)
+            ls = ", ".join(self.missing_deps)
+            if self.can_auto:
+                self.dep_banner.set_title(f"Missing: {ls}. Installing automatically.")
+                self.btn_confirm.set_sensitive(True)
+            else:
+                self.dep_banner.set_title(f"Missing: {ls}. Please install manually.")
+                self.btn_confirm.set_sensitive(False)
+                self.btn_confirm.set_label("Missing Requirements")
+
+        any_inst = False
+        for app in self.valid_apps:
+            ver = get_installed_version(app['id'])
+            ui = self.app_rows[app['id']]
+            if ver:
+                any_inst = True
+                ui['row'].set_subtitle(f"Installed: v{ver} (Source: v{app['APP_VERSION']})")
+                # If installed, we might default check to True, which is already set
+            else:
+                ui['row'].set_subtitle("Not Installed")
+
+        if any_inst: self.hero.set_description('Manage Your Apps'); self.btn_install.set_label('Install / Update'); self.btn_uninstall.set_visible(True)
+        else: self.hero.set_description('Ready to Setup'); self.btn_install.set_label('Install Apps'); self.btn_uninstall.set_visible(False)
+
+    def on_goto_options(self, btn): self.mode = 'install'; self.nav.push(self.page_options)
     def on_uninstall_click(self, btn):
-        self.nav.push(self.page_progress)
+        self.mode = 'uninstall'; self.nav.push(self.page_progress)
         self.prog_status.set_title('Uninstalling...')
         self.prog_status.set_icon_name('user-trash-symbolic')
-        thread = threading.Thread(target=self.run_process, args=('uninstall', False))
-        thread.daemon = True
-        thread.start()
+        threading.Thread(target=self.run_process, daemon=True).start()
+    
+    def on_start_process(self, btn):
+        self.nav.push(self.page_progress)
+        threading.Thread(target=self.run_process, daemon=True).start()
 
-    def set_row_state(self, row, state):
+    def set_row_status(self, ui, status):
         def _u():
-            if state == 'run':
-                row._spinner.set_visible(True); row._spinner.start(); row._icon.set_visible(False)
-            elif state == 'ok':
-                row._spinner.stop(); row._spinner.set_visible(False)
-                row._icon.set_from_icon_name('object-select-symbolic'); row._icon.set_visible(True)
-            elif state == 'trash':
-                row._spinner.stop(); row._spinner.set_visible(False)
-                row._icon.set_from_icon_name('user-trash-symbolic'); row._icon.set_visible(True)
+            if status == 'run':
+                ui['spinner'].set_visible(True); ui['spinner'].start(); ui['icon'].set_visible(False)
+            elif status == 'ok':
+                ui['spinner'].stop(); ui['spinner'].set_visible(False)
+                ui['icon'].set_from_icon_name('object-select-symbolic'); ui['icon'].set_visible(True)
+            elif status == 'trash':
+                ui['spinner'].stop(); ui['spinner'].set_visible(False)
+                ui['icon'].set_from_icon_name('user-trash-symbolic'); ui['icon'].set_visible(True)
+            elif status == 'err':
+                ui['spinner'].stop(); ui['spinner'].set_visible(False)
+                ui['icon'].set_from_icon_name('dialog-error-symbolic'); ui['icon'].add_css_class('error'); ui['icon'].set_visible(True)
         GLib.idle_add(_u)
 
-    def run_process(self, mode, do_autostart):
-        # 1. System Check
-        self.set_row_state(self.row_1, 'run'); time.sleep(0.5)
-        os.makedirs(BIN_DIR, exist_ok=True)
-        os.makedirs(APP_DIR, exist_ok=True)
-        os.makedirs(AUTOSTART_DIR, exist_ok=True)
-        self.set_row_state(self.row_1, 'ok')
+    def run_process(self):
+        if self.mode == 'install' and self.missing_deps and self.can_auto:
+            ui = self.add_progress_row_thread('Installing Dependencies')
+            self.set_row_status(ui, 'run')
+            cmd = ['pkexec', 'dnf', 'install', '-y'] + self.missing_deps
+            rc = subprocess.call(cmd)
+            if rc == 0: self.set_row_status(ui, 'ok')
+            else: self.set_row_status(ui, 'err')
 
-        # 2. Files
-        self.set_row_state(self.row_2, 'run'); time.sleep(0.5)
-        if mode == 'install':
-            if os.path.exists(SOURCE_FILE):
-                shutil.copy2(SOURCE_FILE, TARGET_BIN)
-                st = os.stat(TARGET_BIN)
-                os.chmod(TARGET_BIN, st.st_mode | stat.S_IEXEC)
-                self.set_row_state(self.row_2, 'ok')
-            else: self.set_row_state(self.row_2, 'trash')
-        else:
-            if os.path.exists(TARGET_BIN): os.remove(TARGET_BIN)
-            if os.path.exists(CONFIG_DIR): shutil.rmtree(CONFIG_DIR)
-            self.set_row_state(self.row_2, 'trash')
+        for app in self.valid_apps:
+            if self.mode == 'install':
+                # UX FIX: READ FROM CHECKBOX
+                should = self.app_rows[app['id']]['install_chk'].get_active()
+                start = self.app_rows[app['id']]['autostart_switch'].get_active()
+            else: should = True; start = False
 
-        # 3. Register App
-        self.set_row_state(self.row_3, 'run'); time.sleep(0.3)
-        if mode == 'install':
-            with open(TARGET_DESKTOP, 'w') as f:
-                f.write(f'''[Desktop Entry]
-Type=Application
-Name={APP_NAME}
-Comment=System Update Manager
-Exec=bash "{TARGET_BIN}" --run-gui
-Icon=software-update-available-symbolic
-Terminal=false
-Categories=System;Settings;
-''')
-            subprocess.call(['update-desktop-database', APP_DIR])
-            self.set_row_state(self.row_3, 'ok')
-        else:
-            if os.path.exists(TARGET_DESKTOP): os.remove(TARGET_DESKTOP)
-            subprocess.call(['update-desktop-database', APP_DIR])
-            self.set_row_state(self.row_3, 'trash')
+            if not should and self.mode == 'install': continue
 
-        # 4. Autostart
-        self.set_row_state(self.row_4, 'run'); time.sleep(0.4)
-        if mode == 'install':
-            if do_autostart:
-                with open(TARGET_AUTOSTART, 'w') as f:
-                    f.write(f'''[Desktop Entry]
-Type=Application
-Name={APP_NAME} Monitor
-Exec=bash "{TARGET_BIN}" --check-silent
-Icon=software-update-available-symbolic
-Terminal=false
-Hidden=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
-''')
-                self.set_row_state(self.row_4, 'ok')
-            else:
-                if os.path.exists(TARGET_AUTOSTART): os.remove(TARGET_AUTOSTART)
-                self.set_row_state(self.row_4, 'ok')
-        else:
-            if os.path.exists(TARGET_AUTOSTART): os.remove(TARGET_AUTOSTART)
-            self.set_row_state(self.row_4, 'trash')
+            ui = self.add_progress_row_thread(f"{'Installing' if self.mode == 'install' else 'Removing'} {app['APP_NAME']}")
+            self.set_row_status(ui, 'run'); time.sleep(0.5)
 
-        GLib.idle_add(self.on_done, mode)
+            src = os.path.join(SOURCES_DIR, app['id'])
+            dst = os.path.join(BIN_DIR, app['id'])
+            desk = os.path.join(APP_DIR, f"{app['id']}.desktop")
+            auto = os.path.join(AUTOSTART_DIR, f"{app['id']}.desktop")
 
-    def on_done(self, mode):
-        # Reveal close button only now
+            try:
+                os.makedirs(BIN_DIR, exist_ok=True); os.makedirs(APP_DIR, exist_ok=True); os.makedirs(AUTOSTART_DIR, exist_ok=True)
+                
+                if self.mode == 'install':
+                    if os.path.exists(src):
+                        shutil.copy2(src, dst)
+                        st = os.stat(dst); os.chmod(dst, st.st_mode | stat.S_IEXEC)
+                    
+                    with open(desk, 'w') as f:
+                        f.write(f"[Desktop Entry]\nType=Application\nName={app['APP_NAME']}\nComment={app['APP_DESC']}\nExec=bash \"{dst}\" {app['APP_ARGS_RUN']}\nIcon={app['APP_ICON']}\nTerminal=false\nCategories={app['APP_CATS']}\n")
+                    subprocess.call(['update-desktop-database', APP_DIR])
+
+                    if start:
+                        with open(auto, 'w') as f:
+                            f.write(f"[Desktop Entry]\nType=Application\nName={app['APP_NAME']} Monitor\nExec=bash \"{dst}\" {app['APP_ARGS_AUTO']}\nIcon={app['APP_ICON']}\nTerminal=false\nHidden=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
+                    elif os.path.exists(auto): os.remove(auto)
+                    self.set_row_status(ui, 'ok')
+                else:
+                    if os.path.exists(dst): os.remove(dst)
+                    if os.path.exists(desk): os.remove(desk)
+                    if os.path.exists(auto): os.remove(auto)
+                    cfg = os.path.expanduser(f'~/.config/{app["id"]}') 
+                    if app['id'] == 'monthly-maintenance': cfg = os.path.expanduser('~/.config/monthly-updater')
+                    if os.path.exists(cfg): shutil.rmtree(cfg)
+                    subprocess.call(['update-desktop-database', APP_DIR])
+                    self.set_row_status(ui, 'trash')
+            except Exception as e:
+                print(e)
+                self.set_row_status(ui, 'err')
+
+        GLib.idle_add(self.on_done)
+
+    def on_done(self):
         self.btn_close.set_visible(True)
-        
-        if mode == 'install':
-            self.prog_status.set_title('Complete')
-            self.prog_status.set_description('Installation Successful')
+        if self.mode == 'install':
+            self.prog_status.set_title('Finished')
             self.prog_status.set_icon_name('object-select-symbolic')
             self.prog_status.add_css_class('success')
         else:
             self.prog_status.set_title('Uninstalled')
-            self.prog_status.set_description('Cleanup Complete')
             self.prog_status.set_icon_name('user-trash-symbolic')
 
 class App(Adw.Application):

@@ -1,16 +1,32 @@
 #!/bin/bash
 
 # ==============================================================================
-# FEDORA MONTHLY MAINTENANCE (v7.2 - SMART DATES)
+# FEDORA MONTHLY MAINTENANCE
+# ==============================================================================
+# ==============================================================================
+# ▼▼▼ APP METADATA ▼▼▼
 # ==============================================================================
 
-APP_VERSION="0.1.0"
+APP_ID="monthly-maintenance"
+APP_NAME="Monthly Maintenance"
+APP_VERSION="0.2.0"
+APP_ICON="software-update-available-symbolic"
+APP_DESC="System Update Manager"
+APP_CATS="System;Settings;"
+APP_ARGS_RUN="--run-gui"
+APP_ARGS_AUTO="--check-silent"
+
+APP_DEPS="python3-gobject;python3-libadwaita;libnotify;dnf-automatic;distrobox"
+
+# ==============================================================================
+# ▲▲▲ END METADATA ▲▲▲
+# ==============================================================================
 CONFIG_DIR="$HOME/.config/monthly-updater"
 LOG_FILE="$CONFIG_DIR/maintenance.log"
 STATE_FILE="$CONFIG_DIR/last_successful_update"
 CURRENT_MONTH=$(date +%Y-%m)
 SCRIPT_PATH=$(realpath "$0")
-DESKTOP_FILE_NAME="monthly-maintainer.desktop"
+DESKTOP_FILE_NAME="monthly-maintenance.desktop"
 DESKTOP_FILE_PATH="$HOME/.local/share/applications/$DESKTOP_FILE_NAME"
 
 mkdir -p "$CONFIG_DIR"
