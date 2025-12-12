@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# MONTHLY MAINTENANCE INSTALLER (FIXED SCROLLING v6.2)
+# MONTHLY MAINTENANCE INSTALLER (v0.1.0)
 # ==============================================================================
 
 import sys
