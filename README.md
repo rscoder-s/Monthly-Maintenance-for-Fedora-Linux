@@ -57,3 +57,7 @@ Community involvement is highly encouraged! Since this project is in its infancy
 
 ### Uninstall
 Run the **`Install`** file again and click **Uninstall**. This removes the binary, configuration, logs, and autostart entries cleanly.
+
+### License
+This project is licensed under the **GPLv2 or later**.
+See the [LICENSE](LICENSE) file for details.
