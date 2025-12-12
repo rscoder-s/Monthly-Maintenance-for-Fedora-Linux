@@ -9,7 +9,7 @@
 
 APP_ID="monthly-maintenance"
 APP_NAME="Monthly Maintenance"
-APP_VERSION="0.2.0"
+APP_VERSION="0.1.1"
 APP_ICON="software-update-available-symbolic"
 APP_DESC="System Update Manager"
 APP_CATS="System;Settings;"
