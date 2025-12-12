@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# FEDORA MONTHLY MAINTENANCE
+# FEDORA MONTHLY MAINTENANCE (v7.2 - SMART DATES)
 # ==============================================================================
 
 APP_VERSION="0.1.0"
@@ -13,7 +13,6 @@ SCRIPT_PATH=$(realpath "$0")
 DESKTOP_FILE_NAME="monthly-maintainer.desktop"
 DESKTOP_FILE_PATH="$HOME/.local/share/applications/$DESKTOP_FILE_NAME"
 
-# Ensure directories exist
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$HOME/.local/share/applications"
 
@@ -48,7 +47,7 @@ EOF
     update-desktop-database "$HOME/.local/share/applications" &> /dev/null
 }
 
-# --- HELPER: LAUNCHER FUNCTION ---
+# --- HELPER: LAUNCHER ---
 launch_update_process() {
     if check_gui_support; then
         log_event "ACTION: Direct Launch -> GUI Mode"
@@ -98,8 +97,8 @@ run_terminal_mode() {
     echo ">> [3/3] Distrobox..."
     distrobox-upgrade --all
 
-    echo "$CURRENT_MONTH" > "$STATE_FILE"
-    log_event "STATE CHANGE: Marked $CURRENT_MONTH as complete."
+    date +%Y-%m-%d > "$STATE_FILE"
+    log_event "STATE CHANGE: Marked complete."
     
     echo "MAINTENANCE COMPLETE. Closing in 5s..."
     sleep 5
@@ -111,12 +110,12 @@ run_terminal_mode() {
 # ==============================================================================
 run_gui_mode() {
     export UPDATER_LOG_FILE="$LOG_FILE"
-    export CURRENT_MONTH_TAG="$CURRENT_MONTH"
     export STATE_FILE_PATH="$STATE_FILE"
 
     exec python3 -c "
-import sys, os, subprocess, threading, datetime, signal, gi
+import sys, os, subprocess, threading, datetime, signal, locale
 try:
+    import gi
     gi.require_version('Gtk', '4.0')
     gi.require_version('Adw', '1')
     from gi.repository import Gtk, Adw, GLib, Gio, Pango
@@ -124,21 +123,48 @@ except: sys.exit(1)
 
 APP_ID = 'com.local.MonthlyUpdater'
 LOG_FILE = os.environ.get('UPDATER_LOG_FILE', '/tmp/updater.log')
-TARGET_MONTH_RAW = os.environ.get('CURRENT_MONTH_TAG', '2025-01')
 STATE_FILE = os.environ.get('STATE_FILE_PATH', '/tmp/state')
 
-# --- DATE LOGIC ---
-try:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            raw_date = f.read().strip()
-        last_dt = datetime.datetime.strptime(raw_date + '-01', '%Y-%m-%d')
-        fmt_date = last_dt.strftime('%B %Y')
-        SUBTITLE_TEXT = f'Updates since {fmt_date}'
+try: locale.setlocale(locale.LC_TIME, '')
+except: pass
+
+# --- SMART DATE FORMATTER ---
+def format_long_date(dt):
+    # Determine locale preference by checking how it formats Feb 1st
+    # Feb 1st = 2/1 (Month first) vs 1/2 (Day first)
+    test = datetime.date(2025, 2, 1)
+    test_str = test.strftime('%x')
+    
+    if test_str.startswith('02') or test_str.startswith('2') or test_str.startswith('Feb'):
+        fmt = '%B %d, %Y' # US: December 12, 2025
+    elif test_str.startswith('20'):
+        fmt = '%Y %B %d'  # ISO: 2025 December 12
     else:
-        SUBTITLE_TEXT = 'Initial System Setup'
-except Exception:
-    SUBTITLE_TEXT = 'System Update'
+        fmt = '%d %B %Y'  # World: 12 December 2025
+        
+    return dt.strftime(fmt)
+
+def get_date_info():
+    subtitle = 'Initial System Setup'
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f: raw = f.read().strip()
+            try: last_dt = datetime.datetime.strptime(raw, '%Y-%m-%d')
+            except ValueError: last_dt = datetime.datetime.strptime(raw + '-01', '%Y-%m-%d')
+            
+            sys_fmt = format_long_date(last_dt)
+            subtitle = f'Last successful run: {sys_fmt}'
+    except: subtitle = 'System Update'
+    return subtitle
+
+def get_next_run_date():
+    today = datetime.date.today()
+    if today.month == 12: next_run = datetime.date(today.year + 1, 1, 1)
+    else: next_run = datetime.date(today.year, today.month + 1, 1)
+    return format_long_date(next_run)
+
+SUBTITLE_TEXT = get_date_info()
+NEXT_RUN_TEXT = get_next_run_date()
 
 def log_to_file(msg):
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -148,28 +174,34 @@ class UpdaterWindow(Adw.Window):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.set_title('Monthly Maintenance')
-        self.set_default_size(500, 600)
+        self.set_default_size(520, 650)
         
-        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(self.main_box)
+        self.root_view = Adw.ToolbarView()
+        self.set_content(self.root_view)
         
         self.header = Adw.HeaderBar()
-        self.main_box.append(self.header)
+        self.root_view.add_top_bar(self.header)
+        
+        self.stack = Adw.ViewStack()
+        self.root_view.set_content(self.stack)
+
+        # === PAGE 1: PROGRESS ===
+        self.page_progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         
         self.clamp = Adw.Clamp()
         self.clamp.set_maximum_size(450)
-        self.clamp.set_margin_top(20)
-        self.clamp.set_margin_bottom(20)
+        self.clamp.set_margin_top(12)
+        self.clamp.set_margin_bottom(12)
         self.clamp.set_margin_start(12)
         self.clamp.set_margin_end(12)
-        self.main_box.append(self.clamp)
+        self.page_progress_box.append(self.clamp)
         
         self.content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.clamp.set_child(self.content_box)
 
-        self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        # Hero Header
+        self.header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.header_box.set_margin_bottom(12)
-        
         self.icon = Gtk.Image.new_from_icon_name('software-update-available-symbolic')
         self.icon.set_pixel_size(96)
         self.icon.add_css_class('accent') 
@@ -183,46 +215,73 @@ class UpdaterWindow(Adw.Window):
         self.subtitle_label.add_css_class('title-3')
         self.subtitle_label.add_css_class('dim-label')
         self.header_box.append(self.subtitle_label)
-        
         self.content_box.append(self.header_box)
 
+        # List
         self.group = Adw.PreferencesGroup()
         self.content_box.append(self.group)
-
         self.row_dnf = self.add_row('System Updates (DNF)', 'security-high-symbolic')
         self.row_flatpak = self.add_row('Flatpaks', 'applications-system-symbolic')
         self.row_distrobox = self.add_row('Distrobox Containers', 'package-x-generic-symbolic')
 
+        # Log
         self.expander = Adw.ExpanderRow()
         self.expander.set_title('Details')
-        self.expander.set_subtitle('View update logs')
-        
+        self.expander.set_subtitle('View live logs')
         scroll = Gtk.ScrolledWindow()
-        scroll.set_min_content_height(150)
+        scroll.set_min_content_height(120)
         scroll.set_propagate_natural_height(True)
         scroll.set_has_frame(True)
-        
         self.view = Gtk.TextView()
         self.view.set_editable(False)
         self.view.set_monospace(True)
-        self.view.set_top_margin(8)
-        self.view.set_bottom_margin(8)
-        self.view.set_left_margin(8)
-        self.view.set_right_margin(8)
-        
+        self.view.set_top_margin(8); self.view.set_bottom_margin(8)
+        self.view.set_left_margin(8); self.view.set_right_margin(8)
         self.buff = self.view.get_buffer()
-        self.buff.set_text('Ready to start updates...\\nWaiting for user confirmation.')
-        
+        self.buff.set_text('Ready to start updates...')
         scroll.set_child(self.view)
         self.expander.add_row(scroll)
         self.group.add(self.expander)
 
+        # Start Button
         self.btn = Gtk.Button(label='Start Update')
         self.btn.add_css_class('pill')
         self.btn.add_css_class('suggested-action')
         self.btn.set_size_request(-1, 50) 
         self.btn.connect('clicked', self.start)
         self.content_box.append(self.btn)
+
+        self.stack.add_titled(self.page_progress_box, 'progress', 'Progress')
+
+        # === PAGE 2: RESULTS ===
+        self.page_results = Adw.StatusPage()
+        self.page_results.set_icon_name('emoji-body-symbolic')
+        self.page_results.set_title('Update Complete')
+        
+        self.results_clamp = Adw.Clamp()
+        self.results_clamp.set_maximum_size(450)
+        self.results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.results_clamp.set_child(self.results_box)
+        
+        self.summary_group = Adw.PreferencesGroup()
+        self.summary_group.set_title('Update Summary')
+        self.results_box.append(self.summary_group)
+        
+        self.next_run_row = Adw.ActionRow()
+        self.next_run_row.set_title('Next Scheduled Run')
+        self.next_run_row.set_subtitle(NEXT_RUN_TEXT)
+        self.next_run_row.add_prefix(Gtk.Image.new_from_icon_name('alarm-symbolic'))
+        self.summary_group.add(self.next_run_row)
+
+        self.btn_close = Gtk.Button(label='Close')
+        self.btn_close.add_css_class('pill')
+        self.btn_close.set_size_request(-1, 50)
+        self.btn_close.connect('clicked', lambda x: self.quit_app())
+        self.results_box.append(self.btn_close)
+        
+        self.page_results.set_child(self.results_clamp)
+        self.stack.add_titled(self.page_results, 'results', 'Results')
+
         self.running = False
 
     def add_row(self, title, icon):
@@ -249,7 +308,7 @@ class UpdaterWindow(Adw.Window):
             elif s=='ok':
                 row.spinner.stop(); row.spinner.set_visible(False); row.icon.set_visible(True)
                 row.icon.set_from_icon_name('emoji-body-symbolic'); row.icon.add_css_class('success')
-            elif s=='err':
+            elif s.startswith('err'):
                 row.spinner.stop(); row.spinner.set_visible(False); row.icon.set_visible(True)
                 row.icon.set_from_icon_name('dialog-error-symbolic'); row.icon.add_css_class('error')
         GLib.idle_add(_u)
@@ -266,38 +325,79 @@ class UpdaterWindow(Adw.Window):
         self.log(f'> RUN: {cmd}')
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for l in p.stdout: self.log(l.strip())
+            output_buffer = []
+            for l in p.stdout: 
+                self.log(l.strip())
+                output_buffer.append(l)
             p.wait()
-            if p.returncode==0: self.set_state(row, 'ok'); return True
-            else: self.set_state(row, 'err'); return False
+            full_output = ''.join(output_buffer)
+
+            if p.returncode == 0: 
+                self.set_state(row, 'ok')
+                return ('ok', 'Updated Successfully')
+            else: 
+                self.set_state(row, 'err')
+                reason = f'Failed (Code {p.returncode})'
+                if 'dismissed' in full_output or 'Authorization failed' in full_output:
+                    reason = 'Skipped (User Dismissed)'
+                elif p.returncode == 127:
+                    reason = 'Command not found'
+                return ('err', reason)
         except Exception as e:
-            self.log(f'ERR: {e}'); self.set_state(row, 'err'); return False
+            self.log(f'ERR: {e}')
+            self.set_state(row, 'err')
+            return ('err', str(e))
 
     def run_process(self):
-        ok = True
-        if not self.run_cmd(['pkexec','dnf','update','-y'], self.row_dnf): ok = False
-        if not self.run_cmd(['flatpak','update','-y'], self.row_flatpak): ok = False
-        if not self.run_cmd(['distrobox-upgrade','--all'], self.row_distrobox): ok = False
+        log_to_file('PROCESS: Starting Update Sequence...')
+        results = []
+        
+        s1, r1 = self.run_cmd(['pkexec','dnf','update','-y'], self.row_dnf)
+        results.append(('System Updates', s1, r1))
 
-        if ok:
+        s2, r2 = self.run_cmd(['flatpak','update','-y'], self.row_flatpak)
+        results.append(('Flatpaks', s2, r2))
+
+        s3, r3 = self.run_cmd(['distrobox-upgrade','--all'], self.row_distrobox)
+        results.append(('Distrobox', s3, r3))
+
+        global_success = all(r[1] == 'ok' for r in results)
+
+        if global_success:
             self.log('DONE SUCCESS')
-            try: open(STATE_FILE, 'w').write(TARGET_MONTH_RAW)
-            except: pass
-            GLib.idle_add(self.done, True)
+            try: 
+                with open(STATE_FILE, 'w') as f: f.write(datetime.date.today().isoformat())
+                log_to_file('IO WRITE: State updated.')
+            except Exception as e: log_to_file(f'IO ERROR: {e}')
         else:
-            self.log('DONE ERRORS')
-            GLib.idle_add(self.done, False)
+            self.log('DONE WITH ERRORS/SKIPS')
+            log_to_file('IO SKIP: State file preserved.')
 
-    def done(self, success):
-        self.title_label.set_label('Complete!' if success else 'Failed')
-        self.icon.set_from_icon_name('emoji-body-symbolic' if success else 'dialog-error-symbolic')
-        self.icon.remove_css_class('accent')
-        self.icon.add_css_class('success' if success else 'error')
-        self.btn.set_label('Close')
-        self.btn.set_sensitive(True)
-        self.btn.remove_css_class('suggested-action')
-        self.btn.connect('clicked', lambda x: self.close())
+        GLib.idle_add(self.show_results, global_success, results)
+
+    def show_results(self, success, results):
+        self.stack.set_visible_child_name('results')
+        if success:
+            self.page_results.set_title('Maintenance Complete')
+            self.page_results.set_icon_name('emoji-body-symbolic')
+        else:
+            self.page_results.set_title('Completed with Issues')
+            self.page_results.set_icon_name('dialog-warning-symbolic')
+
+        for title, status, reason in results:
+            row = Adw.ActionRow()
+            row.set_title(title)
+            row.set_subtitle(reason)
+            icon_name = 'checkmark-symbolic' if status == 'ok' else 'dialog-error-symbolic'
+            css_class = 'success' if status == 'ok' else 'error'
+            icon = Gtk.Image.new_from_icon_name(icon_name)
+            icon.add_css_class(css_class)
+            row.add_suffix(icon)
+            self.summary_group.add(row)
+
+    def quit_app(self):
         subprocess.Popen(['pkill', '-f', 'monthly-maintenance'])
+        sys.exit(0)
 
 class App(Adw.Application):
     def __init__(self): super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
@@ -314,80 +414,36 @@ if __name__ == '__main__': App().run(sys.argv)
 
 ensure_permanent_shortcut
 
-if [ "$1" == "--run-terminal" ]; then
-    run_terminal_mode
-fi
-
-if [ "$1" == "--run-gui" ]; then
-    run_gui_mode
-fi
-
-# ==============================================================================
-# CHECK / NOTIFICATION LOGIC
-# ==============================================================================
+if [ "$1" == "--run-terminal" ]; then run_terminal_mode; fi
+if [ "$1" == "--run-gui" ]; then run_gui_mode; fi
 
 NEEDS_UPDATE="yes"
 if [ -f "$STATE_FILE" ]; then
     LAST_REC=$(cat "$STATE_FILE")
-    if [ "$LAST_REC" == "$CURRENT_MONTH" ]; then
-        NEEDS_UPDATE="no"
-    fi
+    LAST_YYYYMM=${LAST_REC:0:7}
+    if [ "$LAST_YYYYMM" == "$CURRENT_MONTH" ]; then NEEDS_UPDATE="no"; fi
 fi
 
-# --- MODE: SILENT CHECK ---
 if [ "$1" == "--check-silent" ]; then
-    if [ "$NEEDS_UPDATE" == "no" ]; then
-        exit 0
-    fi
+    if [ "$NEEDS_UPDATE" == "no" ]; then exit 0; fi
 fi
 
-# --- MODE: MANUAL CHECK ---
 if [ "$1" == "" ] && [ "$NEEDS_UPDATE" == "no" ]; then
     nohup bash -c "
-        RESPONSE_HEALTHY=\$(notify-send \
-            'System Healthy' \
-            'You are up to date. Click to open app.' \
-            --icon=security-high \
-            --urgency=low \
-            --action='default=Open App' \
-            --wait)
-        
-        if [ \"\$RESPONSE_HEALTHY\" == \"default\" ]; then
-            $SCRIPT_PATH --run-gui
-        fi
+        RESPONSE_HEALTHY=\$(notify-send 'System Healthy' 'You are up to date. Click to open app.' --icon=security-high --urgency=low --action='default=Open App' --wait)
+        if [ \"\$RESPONSE_HEALTHY\" == \"default\" ]; then $SCRIPT_PATH --run-gui; fi
     " >/dev/null 2>&1 &
     exit 0
 fi
 
-# ==============================================================================
-# NOTIFICATION LOGIC (Update Required)
-# ==============================================================================
 log_event "NOTIFY: Update required ($CURRENT_MONTH)."
-
 nohup bash -c "
-    RESPONSE=\$(notify-send \
-        'Monthly Update Required' \
-        'Updates pending for $CURRENT_MONTH. Click to start.' \
-        --icon=software-update-available \
-        --urgency=critical \
-        --action='default=Update Now' \
-        --wait)
-
+    RESPONSE=\$(notify-send 'Monthly Update Required' 'Updates pending for $CURRENT_MONTH. Click to start.' --icon=software-update-available --urgency=critical --action='default=Update Now' --wait)
     if [ \"\$RESPONSE\" == \"default\" ]; then
         $SCRIPT_PATH --run-gui
     else
-        RESPONSE_PASSIVE=\$(notify-send \
-            'Update Postponed' \
-            'Maintenance is pending. Click to restart.' \
-            --icon=dialog-warning \
-            --urgency=low \
-            --action='default=Update Now' \
-            --wait)
-            
-        if [ \"\$RESPONSE_PASSIVE\" == \"default\" ]; then
-            $SCRIPT_PATH --run-gui
-        fi
+        RESPONSE_PASSIVE=\$(notify-send 'Update Postponed' 'Maintenance is pending. Click to restart.' --icon=dialog-warning --urgency=low --action='default=Update Now' --wait)
+        if [ \"\$RESPONSE_PASSIVE\" == \"default\" ]; then $SCRIPT_PATH --run-gui; fi
     fi
 " >/dev/null 2>&1 &
-
 exit 0
