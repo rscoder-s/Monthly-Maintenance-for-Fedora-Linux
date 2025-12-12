@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# UNIVERSAL INSTALLER version 0.1.2
+# UNIVERSAL INSTALLER version 0.1.3
 # ==============================================================================
 
 import sys, os, time, shutil, threading, stat, subprocess, re, importlib.util
@@ -63,18 +63,33 @@ def check_smart_dependencies(deps_list):
         elif not check_binary(dep): missing.append(dep)
     return missing
 
+def format_size(size_bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0: return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
+
 # --- METADATA PARSER ---
 def parse_app_metadata(app_id):
     path = os.path.join(SOURCES_DIR, app_id)
     if not os.path.exists(path): return {'error': 'File Not Found'}
     
     try:
+        # Get Size
+        size_b = os.path.getsize(path)
+        
         with open(path, 'r') as f: content = f.read()
         id_match = re.search(r'APP_ID="([^"]+)"', content)
         if not id_match: return {'error': 'Missing APP_ID Header'}
         if id_match.group(1) != app_id: return {'error': f'ID Mismatch'}
         
-        data = { "id": app_id, "default_install": True, "default_autostart": True }
+        data = { 
+            "id": app_id, 
+            "default_install": True, 
+            "default_autostart": True,
+            "size_b": size_b,
+            "size_str": format_size(size_b)
+        }
         
         name_match = re.search(r'APP_NAME="([^"]+)"', content)
         ver_match = re.search(r'APP_VERSION="([^"]+)"', content)
@@ -119,12 +134,14 @@ class InstallerWindow(Adw.Window):
         self.valid_apps = []
         self.corrupt_apps = []
         self.all_deps = set()
+        self.total_size = 0
         
         for app_id in APP_IDS:
             meta = parse_app_metadata(app_id)
             if 'error' in meta: self.corrupt_apps.append(f"{app_id}: {meta['error']}")
             else:
                 self.valid_apps.append(meta)
+                self.total_size += meta['size_b']
                 for d in meta['dependencies']: self.all_deps.add(d)
         
         self.app_rows = {}
@@ -138,10 +155,17 @@ class InstallerWindow(Adw.Window):
         box1 = self.create_base_layout()
         self.page_welcome.set_child(box1['root'])
         
+        # Dynamic Description
+        app_names = [a['APP_NAME'] for a in self.valid_apps]
+        if len(app_names) > 0:
+            desc_text = f" Welcome to the Installation wizard for: {', '.join(app_names)}.\nThe installation will use up to {format_size(self.total_size)} on your disk."
+        else:
+            desc_text = "No apps found in source folder. Please re-download the software."
+
         self.hero = Adw.StatusPage()
         self.hero.set_icon_name('system-software-install-symbolic')
         self.hero.set_title('Software Setup')
-        self.hero.set_description('Universal Installer')
+        self.hero.set_description(desc_text)
         box1['content'].append(self.hero)
         
         self.btn_install = self.create_main_button('Install / Update', 'suggested-action', self.on_goto_options)
@@ -155,15 +179,13 @@ class InstallerWindow(Adw.Window):
         
         self.err_banner = Adw.Banner(); self.err_banner.set_button_label(None); self.err_banner.set_revealed(False)
         box2['content'].append(self.err_banner)
-
-        # --- LICENSE TEXT (Standalone Label) ---
+ # --- LICENSE TEXT (Standalone Label) ---
         lic_label = Gtk.Label(xalign=0, wrap=True)
         lic_label.set_markup(
             "<span size='large' weight='bold'>Terms &amp; License</span>\n\n"
-            "This software is open source, licensed under the "
-            "<a href='https://www.gnu.org/licenses/old-licenses/gpl-2.0.html'>GPLv2 License</a>.\n\n"
-            "<span size='small' color='gray'>THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, "
-            "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY.</span>"
+            "This software is intended to combine the power of the Linux terminal with the ease of a modern interface.\n\n"
+            "<span color='gray'>This is free and open source software (<a href='https://www.gnu.org/licenses/old-licenses/gpl-2.0.html'>GPLv2</a>), "
+            "provided <b>as is</b> without warranty of any kind.</span>"
         )
         lic_label.add_css_class("license-text")
         lic_label.set_margin_bottom(20)
@@ -231,14 +253,14 @@ class InstallerWindow(Adw.Window):
     def create_app_row(self, app):
         row = Adw.ExpanderRow()
         row.set_title(app['APP_NAME'])
-        row.set_subtitle(app['APP_DESC'])
+        row.set_subtitle(f"{app['APP_DESC']} ({app['size_str']})")
         row.set_icon_name(app['APP_ICON'] or 'application-x-executable')
         
         # --- UX FIX: CHECKBOX FOR INSTALL SELECTION ---
         chk_install = Gtk.CheckButton()
         chk_install.set_active(True)
         chk_install.set_valign(Gtk.Align.CENTER)
-        row.add_prefix(chk_install) # Checkbox goes on the LEFT
+        row.add_prefix(chk_install) 
         
         # Autostart Row
         row_auto = Adw.ActionRow()
@@ -250,7 +272,7 @@ class InstallerWindow(Adw.Window):
         row.add_row(row_auto)
         
         # --- LOGIC FIX: CONNECT SIGNAL ---
-        # When Install is unchecked, Autostart must die.
+        # When Install is unchecked, Autostart is disabled and unchecked.
         def on_install_toggled(btn):
             is_installing = btn.get_active()
             row_auto.set_sensitive(is_installing) # Disable the row
@@ -258,8 +280,7 @@ class InstallerWindow(Adw.Window):
                 sw_auto.set_active(False) # Turn off logic
                 row.set_subtitle("Will not be installed")
             else:
-                row.set_subtitle(app['APP_DESC']) # Restore desc
-                # Optional: Restore autostart default? Let's leave it manual for now.
+                row.set_subtitle(f"{app['APP_DESC']} ({app['size_str']})")
                 
         chk_install.connect("toggled", on_install_toggled)
         
@@ -305,13 +326,12 @@ class InstallerWindow(Adw.Window):
             ui = self.app_rows[app['id']]
             if ver:
                 any_inst = True
-                ui['row'].set_subtitle(f"Installed: v{ver} (Source: v{app['APP_VERSION']})")
-                # If installed, we might default check to True, which is already set
+                ui['row'].set_subtitle(f"Installed: version {ver} ({app['size_str']})")
             else:
-                ui['row'].set_subtitle("Not Installed")
+                ui['row'].set_subtitle(f"{app['APP_DESC']} ({app['size_str']})")
 
-        if any_inst: self.hero.set_description('Manage Your Apps'); self.btn_install.set_label('Install / Update'); self.btn_uninstall.set_visible(True)
-        else: self.hero.set_description('Ready to Setup'); self.btn_install.set_label('Install Apps'); self.btn_uninstall.set_visible(False)
+        if any_inst: self.btn_install.set_label('Install / Update'); self.btn_uninstall.set_visible(True)
+        else: self.btn_install.set_label('Install Now'); self.btn_uninstall.set_visible(False)
 
     def on_goto_options(self, btn): self.mode = 'install'; self.nav.push(self.page_options)
     def on_uninstall_click(self, btn):
@@ -350,7 +370,6 @@ class InstallerWindow(Adw.Window):
 
         for app in self.valid_apps:
             if self.mode == 'install':
-                # UX FIX: READ FROM CHECKBOX
                 should = self.app_rows[app['id']]['install_chk'].get_active()
                 start = self.app_rows[app['id']]['autostart_switch'].get_active()
             else: should = True; start = False
